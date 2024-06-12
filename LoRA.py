@@ -1,7 +1,8 @@
+import os
 import torch
 import torch.nn as nn
 from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments, DataCollatorWithPadding
-from datasets import load_dataset
+from datasets import load_from_disk, load_dataset
 import numpy as np
 import pandas as pd
 from sklearn.metrics import f1_score, matthews_corrcoef
@@ -74,16 +75,85 @@ class BertWithLoRA(nn.Module):
         return (loss, logits) if loss is not None else logits
 
     def calculate_P(self, sequence_output):
-        # 예측 확률 P를 계산
         with torch.no_grad():
             P = torch.softmax(sequence_output, dim=-1)
         return P
 
     def calculate_F(self, sequence_output):
-        # 피셔 정보 행렬 F를 계산
         F = torch.var(sequence_output, dim=1, unbiased=False).unsqueeze(-1)
         F = F.expand(-1, -1, self.rank)
         return F
+
+class AbstractTask:
+    name = None
+    split_to_data_split = {}
+
+    def load_dataset(self, split):
+        dataset_path = f"{main_dir}/{self.name}"
+        if not os.path.exists(dataset_path):
+            dataset = load_dataset("glue", self.name)
+            dataset.save_to_disk(dataset_path)
+        return load_from_disk(dataset_path)[self.split_to_data_split[split]]
+
+class COLA(AbstractTask):
+    name = "cola"
+    split_to_data_split = {"train": "train",
+                           "validation": "validation",
+                           "test": "validation"}
+
+class SST2(AbstractTask):
+    name = "sst2"
+    split_to_data_split = {"train": "train",
+                           "validation": "validation",
+                           "test": "validation"}
+
+class MRPC(AbstractTask):
+    name = "mrpc"
+    split_to_data_split = {"train": "train",
+                           "validation": "validation",
+                           "test": "validation"}
+
+class QQP(AbstractTask):
+    name = "qqp"
+    split_to_data_split = {"train": "train",
+                           "validation": "validation",
+                           "test": "validation"}
+
+class STSB(AbstractTask):
+    name = "stsb"
+    split_to_data_split = {"train": "train",
+                           "validation": "validation",
+                           "test": "validation"}
+
+class MNLI(AbstractTask):
+    name = "mnli"
+    split_to_data_split = {"train": "train",
+                           "validation": "validation_matched",
+                           "test": "validation_matched"}
+
+class MNLI_M(AbstractTask):
+    name = "mnli"
+    split_to_data_split = {"train": "train",
+                           "validation": "validation_matched",
+                           "test": "validation_matched"}
+
+class MNLI_MM(AbstractTask):
+    name = "mnli"
+    split_to_data_split = {"train": "train",
+                           "validation": "validation_mismatched",
+                           "test": "validation_mismatched"}
+
+class QNLI(AbstractTask):
+    name = "qnli"
+    split_to_data_split = {"train": "train",
+                           "validation": "validation",
+                           "test": "validation"}
+
+main_dir = "./glue"
+
+task_classes = [COLA, SST2, MRPC, QQP, STSB, MNLI, MNLI_M, MNLI_MM, QNLI]
+
+tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
 task_to_keys = {
     "cola": ("sentence", None),
@@ -121,8 +191,6 @@ task_to_epochs = {
     "wnli": 4,
 }
 
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-
 def tokenize_function(examples, task_name):
     sentence1_key, sentence2_key = task_to_keys[task_name]
     if sentence2_key is None:
@@ -144,21 +212,23 @@ all_results = {}
 
 for lora_type in ['basic', 'mllora', 'fisherlora']:
     results = {}
-    for task_name in task_to_keys.keys():
+    for task_class in task_classes:
+        task_name = task_class.name
+        task = task_class()
         print(f"Training for {task_name} with {lora_type}")
-        datasets = load_dataset("glue", task_name)
-        datasets = datasets.map(lambda examples: tokenize_function(examples, task_name), batched=True)
+        
+        datasets = {
+            split: task.load_dataset(split)
+            for split in ["train", "validation"]
+        }
+        
+        datasets = {k: v.map(lambda examples: tokenize_function(examples, task_name), batched=True) for k, v in datasets.items()}
 
-        if 'validation' not in datasets:
-            datasets['validation'] = datasets['test']
-
-        if task_name == "stsb":
-            model = BertWithLoRA('bert-base-uncased', rank=8, lora_type=lora_type, num_labels=1).to(device)
-        else:
-            model = BertWithLoRA('bert-base-uncased', rank=8, lora_type=lora_type, num_labels=2).to(device)
+        num_labels = 1 if task_name == "stsb" else 2
+        model = BertWithLoRA('bert-base-uncased', rank=8, lora_type=lora_type, num_labels=num_labels).to(device)
 
         training_args = TrainingArguments(
-            output_dir=f'./results/BERT/{task_name}_{lora_type}',
+            output_dir=f'./BERT/results/{task_name}_{lora_type}',
             eval_strategy="epoch",
             learning_rate=2e-5,
             per_device_train_batch_size=16,
