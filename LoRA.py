@@ -1,14 +1,12 @@
-import os
 import torch
 import torch.nn as nn
 from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments, DataCollatorWithPadding
-from datasets import load_from_disk, load_dataset
+from datasets import load_dataset
 import numpy as np
 import pandas as pd
-from sklearn.metrics import f1_score, matthews_corrcoef
-import logging
+from sklearn.metrics import matthews_corrcoef
 
-device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+device = torch.device("mps" if torch.cuda.is_available() else "cpu")
 
 class LoRALayer(nn.Module):
     def __init__(self, input_dim, output_dim, rank):
@@ -31,6 +29,7 @@ class MLLoRALayer(LoRALayer):
 
 class FisherLoRALayer(LoRALayer):
     def forward(self, x, F):
+        F = F.expand_as(x)
         return x + (x @ self.A @ self.B) * F
 
 class BertWithLoRA(nn.Module):
@@ -81,77 +80,8 @@ class BertWithLoRA(nn.Module):
 
     def calculate_F(self, sequence_output):
         F = torch.var(sequence_output, dim=1, unbiased=False).unsqueeze(-1)
-        F = F.expand(-1, -1, self.rank)
+        F = F.expand(-1, sequence_output.size(1), self.rank)
         return F
-
-class AbstractTask:
-    name = None
-    split_to_data_split = {}
-
-    def load_dataset(self, split):
-        dataset_path = f"{main_dir}/{self.name}"
-        if not os.path.exists(dataset_path):
-            dataset = load_dataset("glue", self.name)
-            dataset.save_to_disk(dataset_path)
-        return load_from_disk(dataset_path)[self.split_to_data_split[split]]
-
-class COLA(AbstractTask):
-    name = "cola"
-    split_to_data_split = {"train": "train",
-                           "validation": "validation",
-                           "test": "validation"}
-
-class SST2(AbstractTask):
-    name = "sst2"
-    split_to_data_split = {"train": "train",
-                           "validation": "validation",
-                           "test": "validation"}
-
-class MRPC(AbstractTask):
-    name = "mrpc"
-    split_to_data_split = {"train": "train",
-                           "validation": "validation",
-                           "test": "validation"}
-
-class QQP(AbstractTask):
-    name = "qqp"
-    split_to_data_split = {"train": "train",
-                           "validation": "validation",
-                           "test": "validation"}
-
-class STSB(AbstractTask):
-    name = "stsb"
-    split_to_data_split = {"train": "train",
-                           "validation": "validation",
-                           "test": "validation"}
-
-class MNLI(AbstractTask):
-    name = "mnli"
-    split_to_data_split = {"train": "train",
-                           "validation": "validation_matched",
-                           "test": "validation_matched"}
-
-class MNLI_M(AbstractTask):
-    name = "mnli"
-    split_to_data_split = {"train": "train",
-                           "validation": "validation_matched",
-                           "test": "validation_matched"}
-
-class MNLI_MM(AbstractTask):
-    name = "mnli"
-    split_to_data_split = {"train": "train",
-                           "validation": "validation_mismatched",
-                           "test": "validation_mismatched"}
-
-class QNLI(AbstractTask):
-    name = "qnli"
-    split_to_data_split = {"train": "train",
-                           "validation": "validation",
-                           "test": "validation"}
-
-main_dir = "./glue"
-
-task_classes = [COLA, SST2, MRPC, QQP, STSB, MNLI, MNLI_M, MNLI_MM, QNLI]
 
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
@@ -191,6 +121,10 @@ task_to_epochs = {
     "wnli": 4,
 }
 
+task_to_validation_split = {
+    "mnli": "validation_matched"
+}
+
 def tokenize_function(examples, task_name):
     sentence1_key, sentence2_key = task_to_keys[task_name]
     if sentence2_key is None:
@@ -212,53 +146,55 @@ all_results = {}
 
 for lora_type in ['basic', 'mllora', 'fisherlora']:
     results = {}
-    for task_class in task_classes:
-        task_name = task_class.name
-        task = task_class()
+    for task_name in task_to_keys.keys():
         print(f"Training for {task_name} with {lora_type}")
-        
-        datasets = {
-            split: task.load_dataset(split)
-            for split in ["train", "validation"]
-        }
-        
-        datasets = {k: v.map(lambda examples: tokenize_function(examples, task_name), batched=True) for k, v in datasets.items()}
+        try:
+            datasets = load_dataset("glue", task_name)
 
-        num_labels = 1 if task_name == "stsb" else 2
-        model = BertWithLoRA('bert-base-uncased', rank=8, lora_type=lora_type, num_labels=num_labels).to(device)
+            validation_split = task_to_validation_split.get(task_name, "validation")
+            if validation_split not in datasets:
+                print(f"Validation split '{validation_split}' not found for task '{task_name}', skipping.")
+                continue
 
-        training_args = TrainingArguments(
-            output_dir=f'./BERT/results/{task_name}_{lora_type}',
-            eval_strategy="epoch",
-            learning_rate=2e-5,
-            per_device_train_batch_size=16,
-            per_device_eval_batch_size=16,
-            num_train_epochs=task_to_epochs[task_name],
-            weight_decay=0.01,
-            logging_dir=f'./logs/BERT/{task_name}_{lora_type}',
-            save_strategy="epoch",
-            load_best_model_at_end=True,
-            metric_for_best_model=task_to_best_metric[task_name],
-        )
+            tokenized_datasets = datasets.map(lambda examples: tokenize_function(examples, task_name), batched=True)
 
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=datasets["train"],
-            eval_dataset=datasets["validation"],
-            tokenizer=tokenizer,
-            data_collator=DataCollatorWithPadding(tokenizer),
-            compute_metrics=lambda eval_pred: compute_metrics(eval_pred, task_name),
-        )
+            num_labels = 1 if task_name == "stsb" else 2
+            model = BertWithLoRA('bert-base-uncased', rank=8, lora_type=lora_type, num_labels=num_labels).to(device)
 
-        trainer.train()
-        eval_results = trainer.evaluate()
-        metric_key = task_to_best_metric[task_name]
-        results[task_name] = eval_results[metric_key]
+            training_args = TrainingArguments(
+                output_dir=f'./results/BERT/{task_name}_{lora_type}',
+                evaluation_strategy="epoch",
+                learning_rate=2e-5,
+                per_device_train_batch_size=16,
+                per_device_eval_batch_size=16,
+                num_train_epochs=task_to_epochs[task_name],
+                weight_decay=0.01,
+                logging_dir=f'./logs/BERT/{task_name}_{lora_type}',
+                save_strategy="epoch",
+                load_best_model_at_end=True,
+                metric_for_best_model=task_to_best_metric[task_name],
+            )
+
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=tokenized_datasets["train"],
+                eval_dataset=tokenized_datasets[validation_split],
+                tokenizer=tokenizer,
+                data_collator=DataCollatorWithPadding(tokenizer),
+                compute_metrics=lambda eval_pred: compute_metrics(eval_pred, task_name),
+            )
+
+            trainer.train()
+            eval_results = trainer.evaluate()
+            metric_key = task_to_best_metric[task_name]
+            results[task_name] = eval_results[metric_key]
+        except Exception as e:
+            print(f"Error occurred while training {task_name} with {lora_type}: {str(e)}")
     
     all_results[lora_type] = results
 
 df = pd.DataFrame(all_results)
 df.to_csv('BERT_lora_comparison_results.csv')
 
-print("Evaluation results saved to lora_comparison_results.csv")
+print("Evaluation results saved to BERT_lora_comparison_results.csv")
